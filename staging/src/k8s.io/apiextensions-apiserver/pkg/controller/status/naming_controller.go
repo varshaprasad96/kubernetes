@@ -41,6 +41,7 @@ import (
 	client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions/apiextensions/v1"
 	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
+	"k8s.io/client-go/tools/clusters"
 )
 
 // This controller is reserving names. To avoid conflicts, be sure to run only one instance of the worker at a time.
@@ -86,7 +87,7 @@ func NewNamingConditionController(
 	return c
 }
 
-func (c *NamingConditionController) getAcceptedNamesForGroup(group string) (allResources sets.String, allKinds sets.String) {
+func (c *NamingConditionController) getAcceptedNamesForGroup(clusterName, group string) (allResources sets.String, allKinds sets.String) {
 	allResources = sets.String{}
 	allKinds = sets.String{}
 
@@ -100,11 +101,15 @@ func (c *NamingConditionController) getAcceptedNamesForGroup(group string) (allR
 			continue
 		}
 
+		if curr.GetClusterName() != clusterName {
+			continue
+		}
+
 		// for each item here, see if we have a mutation cache entry that is more recent
 		// this makes sure that if we tight loop on update and run, our mutation cache will show
 		// us the version of the objects we just updated to.
 		item := curr
-		obj, exists, err := c.crdMutationCache.GetByKey(curr.Name)
+		obj, exists, err := c.crdMutationCache.GetByKey(clusters.ToClusterAwareKey(curr.GetClusterName(), curr.Name))
 		if exists && err == nil {
 			item = obj.(*apiextensionsv1.CustomResourceDefinition)
 		}
@@ -122,7 +127,7 @@ func (c *NamingConditionController) getAcceptedNamesForGroup(group string) (allR
 
 func (c *NamingConditionController) calculateNamesAndConditions(in *apiextensionsv1.CustomResourceDefinition) (apiextensionsv1.CustomResourceDefinitionNames, apiextensionsv1.CustomResourceDefinitionCondition, apiextensionsv1.CustomResourceDefinitionCondition) {
 	// Get the names that have already been claimed
-	allResources, allKinds := c.getAcceptedNamesForGroup(in.Spec.Group)
+	allResources, allKinds := c.getAcceptedNamesForGroup(in.GetClusterName(), in.Spec.Group)
 
 	namesAcceptedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
 		Type:   apiextensionsv1.NamesAccepted,
@@ -367,14 +372,40 @@ func (c *NamingConditionController) deleteCustomResourceDefinition(obj interface
 }
 
 func (c *NamingConditionController) requeueAllOtherGroupCRDs(name string) error {
+	// HACK(kcp): name is a key from the shared informer's cache. With the changes we've
+	// made to cache.MetaNamespaceKeyFunc to encode the cluster name as part of the key,
+	// we have to decode it here (into "cluster name" and "name") so we can make sure to
+	// re-encode the key correctly down below when adding to the work queue.
+	clusterName, name := clusters.SplitClusterAwareKey(name)
+
 	pluralGroup := strings.SplitN(name, ".", 2)
+	var groupForName string
+
+	// In case the group is empty because we're adding core resources as CRDs in KCP
+	if len(pluralGroup) == 1 {
+		groupForName = ""
+	} else {
+		// Given name = widgets.example.com
+		// pluralGroup[0] is the name, such as widgets
+		// pluarlGroup[1] is the API group, such as example.com
+		groupForName = pluralGroup[1]
+	}
+
 	list, err := c.crdLister.List(labels.Everything())
 	if err != nil {
 		return err
 	}
+
 	for _, curr := range list {
-		if curr.Spec.Group == pluralGroup[1] && curr.Name != name {
-			c.queue.Add(curr.Name)
+		if curr.ClusterName != clusterName {
+			continue
+		}
+
+		if curr.Spec.Group == groupForName && curr.Name != name {
+			// HACK(kcp): make sure to re-encode the cluster name in the key so
+			// future sync() calls are able to have crdLister.Get() work properly.
+			clusterKey := clusters.ToClusterAwareKey(clusterName, curr.Name)
+			c.queue.Add(clusterKey)
 		}
 	}
 	return nil

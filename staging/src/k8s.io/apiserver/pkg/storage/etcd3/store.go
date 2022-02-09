@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
@@ -117,6 +118,11 @@ func (s *store) Versioner() storage.Versioner {
 
 // Get implements storage.Interface.Get.
 func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, out runtime.Object) error {
+	clusterName, err := genericapirequest.ClusterNameFrom(ctx)
+	if err != nil {
+		klog.Errorf("No cluster defined in Get action for key %s : %s", key, err.Error())
+	}
+
 	key = path.Join(s.pathPrefix, key)
 	startTime := time.Now()
 	getResp, err := s.client.KV.Get(ctx, key)
@@ -141,11 +147,16 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 		return storage.NewInternalError(err.Error())
 	}
 
-	return decode(s.codec, s.versioner, data, out, kv.ModRevision)
+	return decode(s.codec, s.versioner, data, out, kv.ModRevision, clusterName)
 }
 
 // Create implements storage.Interface.Create.
 func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
+	clusterName, err := genericapirequest.ClusterNameFrom(ctx)
+	if err != nil {
+		klog.Errorf("No cluster defined in Create action for key %s : %s", key, err.Error())
+	}
+
 	if version, err := s.versioner.ObjectResourceVersion(obj); err == nil && version != 0 {
 		return errors.New("resourceVersion should not be set on objects to be created")
 	}
@@ -184,7 +195,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 
 	if out != nil {
 		putResp := txnResp.Responses[0].GetResponsePut()
-		return decode(s.codec, s.versioner, data, out, putResp.Header.Revision)
+		return decode(s.codec, s.versioner, data, out, putResp.Header.Revision, clusterName)
 	}
 	return nil
 }
@@ -204,6 +215,13 @@ func (s *store) Delete(
 func (s *store) conditionalDelete(
 	ctx context.Context, key string, out runtime.Object, v reflect.Value, preconditions *storage.Preconditions,
 	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object) error {
+	var err error
+	var clusterName string
+	clusterName, err = genericapirequest.ClusterNameFrom(ctx)
+	if err != nil {
+		klog.Errorf("No cluster defined in conditionalDelete action for key %s : %s", key, err.Error())
+	}
+
 	getCurrentState := func() (*objState, error) {
 		startTime := time.Now()
 		getResp, err := s.client.KV.Get(ctx, key)
@@ -211,11 +229,10 @@ func (s *store) conditionalDelete(
 		if err != nil {
 			return nil, err
 		}
-		return s.getState(getResp, key, v, false)
+		return s.getState(getResp, key, v, false, clusterName)
 	}
 
 	var origState *objState
-	var err error
 	var origStateIsCurrent bool
 	if cachedExistingObject != nil {
 		origState, err = s.getStateFromObject(cachedExistingObject)
@@ -296,14 +313,14 @@ func (s *store) conditionalDelete(
 		if !txnResp.Succeeded {
 			getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
 			klog.V(4).Infof("deletion of %s failed because of a conflict, going to retry", key)
-			origState, err = s.getState(getResp, key, v, false)
+			origState, err = s.getState(getResp, key, v, false, clusterName)
 			if err != nil {
 				return err
 			}
 			origStateIsCurrent = true
 			continue
 		}
-		return decode(s.codec, s.versioner, origState.data, out, origState.rev)
+		return decode(s.codec, s.versioner, origState.data, out, origState.rev, clusterName)
 	}
 }
 
@@ -313,6 +330,11 @@ func (s *store) GuaranteedUpdate(
 	preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
 	trace := utiltrace.New("GuaranteedUpdate etcd3", utiltrace.Field{"type", getTypeName(out)})
 	defer trace.LogIfLong(500 * time.Millisecond)
+
+	clusterName, err := genericapirequest.ClusterNameFrom(ctx)
+	if err != nil {
+		klog.Errorf("No cluster defined in GuaranteedUpdate action for key %s : %s", key, err.Error())
+	}
 
 	v, err := conversion.EnforcePtr(out)
 	if err != nil {
@@ -327,7 +349,7 @@ func (s *store) GuaranteedUpdate(
 		if err != nil {
 			return nil, err
 		}
-		return s.getState(getResp, key, v, ignoreNotFound)
+		return s.getState(getResp, key, v, ignoreNotFound, clusterName)
 	}
 
 	var origState *objState
@@ -411,7 +433,7 @@ func (s *store) GuaranteedUpdate(
 			}
 			// recheck that the data from etcd is not stale before short-circuiting a write
 			if !origState.stale {
-				return decode(s.codec, s.versioner, origState.data, out, origState.rev)
+				return decode(s.codec, s.versioner, origState.data, out, origState.rev, clusterName)
 			}
 		}
 
@@ -442,7 +464,7 @@ func (s *store) GuaranteedUpdate(
 		if !txnResp.Succeeded {
 			getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
 			klog.V(4).Infof("GuaranteedUpdate of %s failed because of a conflict, going to retry", key)
-			origState, err = s.getState(getResp, key, v, ignoreNotFound)
+			origState, err = s.getState(getResp, key, v, ignoreNotFound, clusterName)
 			if err != nil {
 				return err
 			}
@@ -452,7 +474,7 @@ func (s *store) GuaranteedUpdate(
 		}
 		putResp := txnResp.Responses[0].GetResponsePut()
 
-		return decode(s.codec, s.versioner, data, out, putResp.Header.Revision)
+		return decode(s.codec, s.versioner, data, out, putResp.Header.Revision, clusterName)
 	}
 }
 
@@ -468,6 +490,12 @@ func (s *store) GetToList(ctx context.Context, key string, listOpts storage.List
 		utiltrace.Field{"limit", pred.Limit},
 		utiltrace.Field{"continue", pred.Continue})
 	defer trace.LogIfLong(500 * time.Millisecond)
+
+	clusterName, err := genericapirequest.ClusterNameFrom(ctx)
+	if err != nil {
+		klog.Errorf("No cluster defined in GetToList action for key %s : %s", key, err.Error())
+	}
+
 	listPtr, err := meta.GetItemsPtr(listObj)
 	if err != nil {
 		return err
@@ -504,7 +532,7 @@ func (s *store) GetToList(ctx context.Context, key string, listOpts storage.List
 		if err != nil {
 			return storage.NewInternalError(err.Error())
 		}
-		if err := appendListItem(v, data, uint64(getResp.Kvs[0].ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
+		if err := appendListItem(v, data, uint64(getResp.Kvs[0].ModRevision), pred, s.codec, s.versioner, newItemFunc, clusterName); err != nil {
 			return err
 		}
 	}
@@ -548,24 +576,24 @@ func (s *store) Count(key string) (int64, error) {
 	return getResp.Count, nil
 }
 
-// continueToken is a simple structured object for encoding the state of a continue token.
+// ContinueToken is a simple structured object for encoding the state of a continue token.
 // TODO: if we change the version of the encoded from, we can't start encoding the new version
 // until all other servers are upgraded (i.e. we need to support rolling schema)
 // This is a public API struct and cannot change.
-type continueToken struct {
+type ContinueToken struct {
 	APIVersion      string `json:"v"`
 	ResourceVersion int64  `json:"rv"`
 	StartKey        string `json:"start"`
 }
 
-// parseFrom transforms an encoded predicate from into a versioned struct.
+// DecodeContinue transforms an encoded predicate from into a versioned struct.
 // TODO: return a typed error that instructs clients that they must relist
-func decodeContinue(continueValue, keyPrefix string) (fromKey string, rv int64, err error) {
+func DecodeContinue(continueValue, keyPrefix string) (fromKey string, rv int64, err error) {
 	data, err := base64.RawURLEncoding.DecodeString(continueValue)
 	if err != nil {
 		return "", 0, fmt.Errorf("continue key is not valid: %v", err)
 	}
-	var c continueToken
+	var c ContinueToken
 	if err := json.Unmarshal(data, &c); err != nil {
 		return "", 0, fmt.Errorf("continue key is not valid: %v", err)
 	}
@@ -595,13 +623,13 @@ func decodeContinue(continueValue, keyPrefix string) (fromKey string, rv int64, 
 	}
 }
 
-// encodeContinue returns a string representing the encoded continuation of the current query.
-func encodeContinue(key, keyPrefix string, resourceVersion int64) (string, error) {
+// EncodeContinue returns a string representing the encoded continuation of the current query.
+func EncodeContinue(key, keyPrefix string, resourceVersion int64) (string, error) {
 	nextKey := strings.TrimPrefix(key, keyPrefix)
 	if nextKey == key {
 		return "", fmt.Errorf("unable to encode next field: the key and key prefix do not match")
 	}
-	out, err := json.Marshal(&continueToken{APIVersion: "meta.k8s.io/v1", ResourceVersion: resourceVersion, StartKey: nextKey})
+	out, err := json.Marshal(&ContinueToken{APIVersion: "meta.k8s.io/v1", ResourceVersion: resourceVersion, StartKey: nextKey})
 	if err != nil {
 		return "", err
 	}
@@ -663,7 +691,7 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 	var continueKey string
 	switch {
 	case s.pagingEnabled && len(pred.Continue) > 0:
-		continueKey, continueRV, err = decodeContinue(pred.Continue, keyPrefix)
+		continueKey, continueRV, err = DecodeContinue(pred.Continue, keyPrefix)
 		if err != nil {
 			return apierrors.NewBadRequest(fmt.Sprintf("invalid continue token: %v", err))
 		}
@@ -775,7 +803,21 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 				return storage.NewInternalErrorf("unable to transform key %q: %v", kv.Key, err)
 			}
 
-			if err := appendListItem(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
+			cluster, err := genericapirequest.ValidClusterFrom(ctx)
+			if err != nil {
+				return storage.NewInternalErrorf("unable to get cluster for key %q: %v", kv.Key, err)
+			}
+			clusterName := cluster.Name
+			if cluster.Wildcard {
+				sub := strings.TrimPrefix(string(kv.Key), keyPrefix)
+				if i := strings.Index(sub, "/"); i != -1 {
+					clusterName = sub[:i]
+				}
+				if clusterName == "" {
+					klog.Errorf("the cluster name of extracted object should not be empty for key %q", kv.Key)
+				}
+			}
+			if err := appendListItem(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc, clusterName); err != nil {
 				return err
 			}
 			numEvald++
@@ -808,7 +850,7 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 	// we never return a key that the client wouldn't be allowed to see
 	if hasMore {
 		// we want to start immediately after the last key
-		next, err := encodeContinue(string(lastKey)+"\x00", keyPrefix, returnedRV)
+		next, err := EncodeContinue(string(lastKey)+"\x00", keyPrefix, returnedRV)
 		if err != nil {
 			return err
 		}
@@ -876,10 +918,21 @@ func (s *store) watch(ctx context.Context, key string, opts storage.ListOptions,
 		return nil, err
 	}
 	key = path.Join(s.pathPrefix, key)
-	return s.watcher.Watch(ctx, key, int64(rev), recursive, opts.ProgressNotify, opts.Predicate)
+
+	// HACK: would need to be an argument to storage (or a change to how decoding works for key structure)
+	cluster, err := genericapirequest.ValidClusterFrom(ctx)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Invalid cluster for key %s : %v", key, err))
+	}
+	clusterName := cluster.Name
+	if cluster.Wildcard {
+		clusterName = "*"
+	}
+
+	return s.watcher.Watch(ctx, key, int64(rev), recursive, clusterName, opts.ProgressNotify, opts.Predicate)
 }
 
-func (s *store) getState(getResp *clientv3.GetResponse, key string, v reflect.Value, ignoreNotFound bool) (*objState, error) {
+func (s *store) getState(getResp *clientv3.GetResponse, key string, v reflect.Value, ignoreNotFound bool, clusterName string) (*objState, error) {
 	state := &objState{
 		meta: &storage.ResponseMeta{},
 	}
@@ -906,7 +959,7 @@ func (s *store) getState(getResp *clientv3.GetResponse, key string, v reflect.Va
 		state.meta.ResourceVersion = uint64(state.rev)
 		state.data = data
 		state.stale = stale
-		if err := decode(s.codec, s.versioner, state.data, state.obj, state.rev); err != nil {
+		if err := decode(s.codec, s.versioner, state.data, state.obj, state.rev, clusterName); err != nil {
 			return nil, err
 		}
 	}
@@ -990,7 +1043,7 @@ func (s *store) validateMinimumResourceVersion(minimumResourceVersion string, ac
 
 // decode decodes value of bytes into object. It will also set the object resource version to rev.
 // On success, objPtr would be set to the object.
-func decode(codec runtime.Codec, versioner storage.Versioner, value []byte, objPtr runtime.Object, rev int64) error {
+func decode(codec runtime.Codec, versioner storage.Versioner, value []byte, objPtr runtime.Object, rev int64, clusterName string) error {
 	if _, err := conversion.EnforcePtr(objPtr); err != nil {
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
@@ -1002,11 +1055,30 @@ func decode(codec runtime.Codec, versioner storage.Versioner, value []byte, objP
 	if err := versioner.UpdateObject(objPtr, uint64(rev)); err != nil {
 		klog.Errorf("failed to update object version: %v", err)
 	}
+	// HACK: in order to support CRD tenancy, the clusterName, which is extracted from the object etcd key,
+	// should be set on the decoded object.
+	// This is done here since we want to set the logical cluster the object is part of,
+	// without storing the clusterName inside the etcd object itself (as it has been until now).
+	// The etcd key is ultimately the only thing that links us to a cluster
+	if clusterName != "" {
+		if s, ok := objPtr.(metav1.ObjectMetaAccessor); ok {
+			s.GetObjectMeta().SetClusterName(clusterName)
+		} else if s, ok := objPtr.(metav1.Object); ok {
+			s.SetClusterName(clusterName)
+		} else if s, ok := objPtr.(*unstructured.Unstructured); ok {
+			s.SetClusterName(clusterName)
+		} else {
+			klog.Warningf("Could not set ClusterName %s in appendListItem on object: %T", clusterName, objPtr)
+		}
+	} else {
+		klog.Errorf("Cluster should not be unknown")
+	}
+
 	return nil
 }
 
 // appendListItem decodes and appends the object (if it passes filter) to v, which must be a slice.
-func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.SelectionPredicate, codec runtime.Codec, versioner storage.Versioner, newItemFunc func() runtime.Object) error {
+func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.SelectionPredicate, codec runtime.Codec, versioner storage.Versioner, newItemFunc func() runtime.Object, clusterName string) error {
 	obj, _, err := codec.Decode(data, nil, newItemFunc())
 	if err != nil {
 		return err
@@ -1015,6 +1087,26 @@ func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.Selec
 	if err := versioner.UpdateObject(obj, rev); err != nil {
 		klog.Errorf("failed to update object version: %v", err)
 	}
+
+	// HACK: in order to support CRD tenancy, the clusterName, which is extracted from the object etcd key,
+	// should be set on the decoded object.
+	// This is done here since we want to set the logical cluster the object is part of,
+	// without storing the clusterName inside the etcd object itself (as it has been until now).
+	// The etcd key is ultimately the only thing that links us to a cluster
+	if clusterName != "" {
+		if s, ok := obj.(metav1.ObjectMetaAccessor); ok {
+			s.GetObjectMeta().SetClusterName(clusterName)
+		} else if s, ok := obj.(metav1.Object); ok {
+			s.SetClusterName(clusterName)
+		} else if s, ok := obj.(*unstructured.Unstructured); ok {
+			s.SetClusterName(clusterName)
+		} else {
+			klog.Warningf("Could not set ClusterName %s in appendListItem on object: %T", clusterName, obj)
+		}
+	} else {
+		klog.Errorf("Cluster should not be unknown")
+	}
+
 	if matched, err := pred.Matches(obj); err == nil && matched {
 		v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
 	}
