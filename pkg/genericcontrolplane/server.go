@@ -46,6 +46,7 @@ import (
 	clientgoinformers "k8s.io/client-go/informers"
 	kubeexternalinformers "k8s.io/client-go/informers"
 	clientgoclientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/keyutil"
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 	"k8s.io/component-base/version"
 	"k8s.io/klog/v2"
@@ -172,6 +173,16 @@ func CreateKubeAPIServerConfig(
 		return nil, err
 	}
 
+	// Load the public keys.
+	var pubKeys []interface{}
+	for _, f := range o.Authentication.ServiceAccounts.KeyFiles {
+		keys, err := keyutil.PublicKeysFromFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse key file %q: %v", f, err)
+		}
+		pubKeys = append(pubKeys, keys...)
+	}
+
 	config := &apis.Config{
 		GenericConfig: genericConfig,
 		ExtraConfig: apis.ExtraConfig{
@@ -184,6 +195,13 @@ func CreateKubeAPIServerConfig(
 
 			IdentityLeaseDurationSeconds:      o.IdentityLeaseDurationSeconds,
 			IdentityLeaseRenewIntervalSeconds: o.IdentityLeaseRenewIntervalSeconds,
+
+			ServiceAccountIssuer:        o.ServiceAccountIssuer,
+			ServiceAccountMaxExpiration: o.ServiceAccountTokenMaxExpiration,
+			ExtendExpiration:            o.Authentication.ServiceAccounts.ExtendExpiration,
+			ServiceAccountIssuerURL:     o.Authentication.ServiceAccounts.Issuers[0], // panic?
+			ServiceAccountJWKSURI:       o.Authentication.ServiceAccounts.JWKSURI,
+			ServiceAccountPublicKeys:    pubKeys,
 		},
 	}
 
@@ -309,7 +327,7 @@ func BuildGenericConfig(
 	genericConfig.LoopbackClientConfig.DisableCompression = true
 
 	kubeClientConfig := genericConfig.LoopbackClientConfig
-	clientutils.EnableMultiCluster(genericConfig.LoopbackClientConfig, genericConfig, true, "namespaces", "apiservices", "customresourcedefinitions", "clusterroles", "clusterrolebindings", "roles", "rolebindings")
+	clientutils.EnableMultiCluster(genericConfig.LoopbackClientConfig, genericConfig, true, "namespaces", "apiservices", "customresourcedefinitions", "clusterroles", "clusterrolebindings", "roles", "rolebindings", "serviceaccounts", "secrets")
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
 	if err != nil {
 		lastErr = fmt.Errorf("failed to create real external clientset: %v", err)
@@ -318,7 +336,7 @@ func BuildGenericConfig(
 	versionedInformers := clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
 
 	// Authentication.ApplyTo requires already applied OpenAPIConfig and EgressSelector if present
-	if lastErr = AuthenticationApplyTo(o.Authentication, &genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig); lastErr != nil {
+	if lastErr = o.Authentication.ApplyTo(&genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig, clientgoExternalClient, versionedInformers); lastErr != nil {
 		return
 	}
 
