@@ -14,15 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package apiserver
+package builder
 
 import (
-	"k8s.io/apiserver/pkg/registry/rest"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-// TableConverterProvider provides a rest.TableConverter for a given group, kind, and listKind.
-type TableConverterProvider interface {
-	// GetTableConverter returns a rest.TableConverter for a given group, kind, and listKind, or nil if
-	// the provider is unable to do so.
-	GetTableConverter(group, kind, listKind string) rest.TableConvertor
+var dotlessKubeGroups = sets.NewString(
+	"",
+	"apps",
+	"batch",
+	"extensions",
+	"policy",
+)
+
+// HACK: support the case when we add "dotless" built-in API groups
+func packagePrefix(group string) string {
+	if strings.Contains(group, ".") {
+		return group
+	}
+
+	if !dotlessKubeGroups.Has(group) {
+		// Shouldn't really be possible...
+		return group
+	}
+
+	if group == "" {
+		group = "core"
+	}
+
+	return "k8s.io/api/" + group
 }

@@ -14,15 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package apiserver
+package validation
 
-import (
-	"k8s.io/apiserver/pkg/registry/rest"
+import "k8s.io/apimachinery/pkg/util/sets"
+
+var kubernetesAPIGroups = sets.NewString(
+	"admissionregistration.k8s.io",
+	"apps",
+	"authentication.k8s.io",
+	"authorization.k8s.io",
+	"autoscaling",
+	"batch",
+	"certificates.k8s.io",
+	"coordination.k8s.io",
+	"discovery.k8s.io",
+	"events.k8s.io",
+	"extensions",
+	"flowcontrol.apiserver.k8s.io",
+	"imagepolicy.k8s.io",
+	"policy",
+	"rbac.authorization.k8s.io",
+	"scheduling.k8s.io",
+	"storage.k8s.io",
+	"",
 )
 
-// TableConverterProvider provides a rest.TableConverter for a given group, kind, and listKind.
-type TableConverterProvider interface {
-	// GetTableConverter returns a rest.TableConverter for a given group, kind, and listKind, or nil if
-	// the provider is unable to do so.
-	GetTableConverter(group, kind, listKind string) rest.TableConvertor
+func isKubernetesAPIGroup(group string) bool {
+	return kubernetesAPIGroups.Has(group)
 }
